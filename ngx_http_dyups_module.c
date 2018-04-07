@@ -4,6 +4,8 @@
 #include <ngx_http_dyups_lua.h>
 #endif
 
+#include "cJSON.h"
+
 
 #define NGX_DYUPS_DELETING     1
 #define NGX_DYUPS_DELETED      2
@@ -118,8 +120,8 @@ static ngx_int_t ngx_http_dyups_get_peer(ngx_peer_connection_t *pc, void *data);
 static void ngx_http_dyups_free_peer(ngx_peer_connection_t *pc, void *data,
     ngx_uint_t state);
 static void *ngx_http_dyups_create_srv_conf(ngx_conf_t *cf);
-static ngx_buf_t *ngx_http_dyups_show_list(ngx_http_request_t *r);
-static ngx_buf_t *ngx_http_dyups_show_detail(ngx_http_request_t *r);
+//static ngx_buf_t *ngx_http_dyups_show_list(ngx_http_request_t *r);
+//static ngx_buf_t *ngx_http_dyups_show_detail(ngx_http_request_t *r);
 static ngx_buf_t *ngx_http_dyups_show_upstream(ngx_http_request_t *r,
     ngx_http_dyups_srv_conf_t *duscf);
 static ngx_int_t ngx_http_dyups_init_shm_zone(ngx_shm_zone_t *shm_zone,
@@ -160,6 +162,12 @@ static ngx_int_t ngx_dyups_add_upstream_filter(
 static ngx_int_t ngx_dyups_del_upstream_filter(
     ngx_http_upstream_main_conf_t *umcf, ngx_http_upstream_srv_conf_t *uscf);
 
+//batch upstream interface
+static ngx_int_t ngx_dyups_update_upstream_batch(ngx_http_request_t *r, ngx_str_t *name, ngx_buf_t *buf, ngx_str_t *rv);
+static ngx_buf_t *
+ngx_http_dyups_show_detail_json(ngx_http_request_t *r);
+static ngx_buf_t *
+ngx_http_dyups_show_list_json(ngx_http_request_t *r);
 
 ngx_int_t (*ngx_dyups_add_upstream_top_filter)
     (ngx_http_upstream_main_conf_t *umcf, ngx_http_upstream_srv_conf_t *uscf);
@@ -530,7 +538,6 @@ ngx_http_dyups_init(ngx_conf_t *cf)
 #endif
 }
 
-
 static ngx_int_t
 ngx_http_dyups_init_process(ngx_cycle_t *cycle)
 {
@@ -721,11 +728,152 @@ ngx_http_dyups_interface_handler(ngx_http_request_t *r)
         return ngx_http_dyups_do_get(r, res);
     }
 
+    return ngx_http_dyups_interface_read_body(r);
+
     if (r->method == NGX_HTTP_DELETE) {
         return ngx_http_dyups_do_delete(r, res);
     }
+}
 
-    return ngx_http_dyups_interface_read_body(r);
+typedef struct {
+    ngx_str_t *name;
+    void *next;
+} ngx_upstream_name_t;
+
+ngx_upstream_name_t *
+ngx_dyups_upstream_delete_json_process(ngx_http_request_t *r, ngx_buf_t *buf, ngx_str_t *rv) {
+    // get data
+    ngx_upstream_name_t *head = NULL, *tail = NULL;
+    ngx_slab_pool_t    *shpool;
+    u_char *json_buf = NULL;
+
+    long len = buf->last - buf->pos;
+    if (len <= 0) {
+        ngx_str_set(rv, "body is null\n");
+        return NULL;
+    }
+
+    shpool = ngx_dyups_global_ctx.shpool;
+
+    // if(ngx_buf_in_memory_only(buf)) {
+    //     ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+    //                   "[dyups] too large body, len %d", len);
+    //     ngx_str_set(rv, "too large body\n");
+    //     return NULL;
+    // }
+
+    json_buf = (u_char *)malloc((len + 1)*sizeof(u_char));
+    memcpy(json_buf, buf->pos, buf->last - buf->pos);
+    json_buf[buf->last - buf->pos] = 0;
+
+    ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                      "[dyups] buf len %d, body content %s", len, json_buf);
+
+    // parse upstreams from the server list
+    cJSON *upsJson = cJSON_Parse((char *)(json_buf));
+    if (!upsJson) {
+       ngx_str_set(rv, "json parse error");
+       return NULL;
+    }
+
+    int i;
+    for (i = 0; i < cJSON_GetArraySize(upsJson); i ++) {
+        if(tail == NULL) {
+            head = (ngx_upstream_name_t *) malloc(sizeof(ngx_upstream_name_t));
+            head->next = NULL;
+            tail = head;
+        } else {
+            ngx_upstream_name_t *tmp = (ngx_upstream_name_t *) malloc(sizeof(ngx_upstream_name_t));
+            tmp->next = NULL;
+            tail->next = (void *) tmp;
+            tail = tmp;    
+        }        
+
+        cJSON * subitem = cJSON_GetArrayItem(upsJson, i);
+
+        cJSON *cjson_name = cJSON_GetObjectItem(subitem, "name");
+        if(cjson_name == NULL) {
+            ngx_str_set(rv, "json parse error\n");
+            return NULL;
+        }
+
+        char *nameStr = cJSON_Print(cjson_name);
+    
+        u_char *name = (u_char *)malloc(strlen(nameStr)*sizeof(u_char));
+        int name_len = ngx_sprintf(name, "%s", nameStr) - name;
+        tail->name = (ngx_str_t*)malloc(sizeof(ngx_str_t));        
+        tail->name->data  = ngx_slab_alloc_locked(shpool, 30);
+
+        memcpy(tail->name->data, name + 1, name_len-2);
+        tail->name->len = name_len - 2;
+        free(name); 
+    }
+
+    free(json_buf);
+
+    return head;
+}
+
+ngx_int_t
+ngx_dyups_delete_upstream_batch(ngx_http_request_t *r, ngx_buf_t *buf, ngx_str_t *rv)
+{
+    ngx_int_t                    status, rc;
+    ngx_event_t                 *timer;
+    ngx_slab_pool_t             *shpool;
+    ngx_http_dyups_main_conf_t  *dmcf;
+
+    ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0, "[dyups] ngx_dyups_delete_upstream_batch");
+
+    ngx_upstream_name_t *ups = ngx_dyups_upstream_delete_json_process(r, buf, rv);
+
+    dmcf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
+                                               ngx_http_dyups_module);
+    timer = &ngx_dyups_global_ctx.msg_timer;
+    shpool = ngx_dyups_global_ctx.shpool;
+
+    if (!ngx_http_dyups_api_enable) {
+        ngx_str_set(rv, "API disabled\n");
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    if (!dmcf->trylock) {
+
+        ngx_shmtx_lock(&shpool->mutex);
+
+    } else {
+
+        if (!ngx_shmtx_trylock(&shpool->mutex)) {
+            return NGX_HTTP_CONFLICT;
+        }
+
+    }
+
+    ngx_http_dyups_read_msg_locked(timer);
+
+    while (ups) {
+        ngx_str_t *name = ups->name;
+
+        status = ngx_dyups_do_delete(name, rv);
+        if (status != NGX_HTTP_OK) {
+            goto finish;
+        }
+
+        rc = ngx_http_dyups_send_msg(name, NULL, NGX_DYUPS_DELETE);
+        if (rc != NGX_OK) {
+            ngx_str_set(rv, "alert: delte success but not sync to other process");
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0, "[dyups] %V", &rv);
+            status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto finish;
+        }
+
+        ups = (ngx_upstream_name_t *)ups->next;
+    }   
+
+ finish:
+
+    ngx_shmtx_unlock(&shpool->mutex);
+
+    return status;
 }
 
 
@@ -805,7 +953,7 @@ ngx_http_dyups_do_get(ngx_http_request_t *r, ngx_array_t *resource)
     if (value[0].len == 4
         && ngx_strncasecmp(value[0].data, (u_char *) "list", 4) == 0)
     {
-        buf = ngx_http_dyups_show_list(r);
+        buf = ngx_http_dyups_show_list_json(r);
         if (buf == NULL) {
             status = NGX_HTTP_INTERNAL_SERVER_ERROR;
             goto finish;
@@ -815,7 +963,7 @@ ngx_http_dyups_do_get(ngx_http_request_t *r, ngx_array_t *resource)
     if (value[0].len == 6
         && ngx_strncasecmp(value[0].data, (u_char *) "detail", 6) == 0)
     {
-        buf = ngx_http_dyups_show_detail(r);
+        buf = ngx_http_dyups_show_detail_json(r);
         if (buf == NULL) {
             status = NGX_HTTP_INTERNAL_SERVER_ERROR;
             goto finish;
@@ -875,7 +1023,75 @@ finish:
     return ngx_http_output_filter(r, &out);
 }
 
+static ngx_buf_t *
+ngx_http_dyups_show_list_json(ngx_http_request_t *r)
+{
+    ngx_uint_t                   i, len;
+    ngx_str_t                    host;
+    ngx_buf_t                   *buf;
+    ngx_http_dyups_srv_conf_t   *duscfs, *duscf;
+    ngx_http_dyups_main_conf_t  *dumcf;
 
+    dumcf = ngx_http_get_module_main_conf(r, ngx_http_dyups_module);
+
+    if (dumcf->dy_upstreams.nelts < 1) {
+        return NULL;
+    }
+
+    len = 2;
+    duscfs = dumcf->dy_upstreams.elts;
+    for (i = 0; i < dumcf->dy_upstreams.nelts; i++) {
+
+        duscf = &duscfs[i];
+
+        if (!duscf->dynamic) {
+            continue;
+        }
+
+        if (duscf->deleted) {
+            continue;
+        }
+
+        len += duscf->upstream->host.len + 20;
+    }
+
+    buf = ngx_create_temp_buf(r->pool, len);
+    if (buf == NULL) {
+        return NULL;
+    }
+
+    buf->last = ngx_sprintf(buf->last, "[");
+
+    for (i = 0; i < dumcf->dy_upstreams.nelts; i++) {
+        buf->last = ngx_sprintf(buf->last, "{");
+
+        duscf = &duscfs[i];
+
+        if (!duscf->dynamic) {
+            buf->last -= 1;
+            continue;
+        }
+
+        if (duscf->deleted) {
+            buf->last -= 1;
+            continue;
+        }
+
+        host = duscf->upstream->host;
+        buf->last = ngx_sprintf(buf->last, "\"name\":\"%V\"", &host);
+
+        buf->last = ngx_sprintf(buf->last, "}");
+
+        if ((i + 1) < dumcf->dy_upstreams.nelts) {
+            buf->last = ngx_sprintf(buf->last, ",");
+        }
+    }
+
+    buf->last = ngx_sprintf(buf->last, "]");
+
+    return buf;
+}
+/*
 static ngx_buf_t *
 ngx_http_dyups_show_list(ngx_http_request_t *r)
 {
@@ -927,8 +1143,93 @@ ngx_http_dyups_show_list(ngx_http_request_t *r)
 
     return buf;
 }
+*/
 
+static ngx_buf_t *
+ngx_http_dyups_show_detail_json(ngx_http_request_t *r)
+{
+    ngx_uint_t                   i, j, len;
+    ngx_str_t                    host;
+    ngx_buf_t                   *buf;
+    ngx_http_dyups_srv_conf_t   *duscfs, *duscf;
+    ngx_http_dyups_main_conf_t  *dumcf;
+    ngx_http_upstream_server_t  *us;
 
+    dumcf = ngx_http_get_module_main_conf(r, ngx_http_dyups_module);
+
+    len = 0;
+    duscfs = dumcf->dy_upstreams.elts;
+    for (i = 0; i < dumcf->dy_upstreams.nelts; i++) {
+
+        duscf = &duscfs[i];
+
+        if (!duscf->dynamic) {
+            continue;
+        }
+
+        if (duscf->deleted) {
+            continue;
+        }
+
+        len += duscf->upstream->host.len + 1;
+
+        for (j = 0; j < duscf->upstream->servers->nelts; j++) {
+            len += sizeof("server ") + 256;
+        }
+    }
+
+    buf = ngx_create_temp_buf(r->pool, len);
+    if (buf == NULL) {
+        buf->last -= 1;
+        return NULL;
+    }
+
+    if (dumcf->dy_upstreams.nelts < 1) {
+        buf->last -= 1;
+        return buf;
+    }
+
+    buf->last = ngx_sprintf(buf->last, "[");
+
+    for (i = 0; i < dumcf->dy_upstreams.nelts; i++) {
+        duscf = &duscfs[i];
+
+        if (!duscf->dynamic) {
+            continue;
+        }
+
+        if (duscf->deleted) {
+            continue;
+        }
+
+        host = duscf->upstream->host;
+        //buf->last = ngx_sprintf(buf->last, "%V\n", &host);
+        buf->last = ngx_sprintf(buf->last, "{\"name\": \"%V\", ", &host);
+
+        buf->last = ngx_sprintf(buf->last, "\"servers\": [", &host);
+
+        us = duscf->upstream->servers->elts;
+        for (j = 0; j < duscf->upstream->servers->nelts; j++) {
+            buf->last = ngx_sprintf(buf->last, "{\"server\": \"%V\"}",
+                                    &us[j].addrs->name);
+            if ((j + 1) < duscf->upstream->servers->nelts) {
+                buf->last = ngx_sprintf(buf->last, ",");   
+            }
+        }
+
+        buf->last = ngx_sprintf(buf->last, "]}");
+
+        if((i + 1) < dumcf->dy_upstreams.nelts) {
+            buf->last = ngx_sprintf(buf->last, ",");
+        }
+    }
+
+    buf->last = ngx_sprintf(buf->last, "]");
+
+    return buf;
+}
+
+/*
 static ngx_buf_t *
 ngx_http_dyups_show_detail(ngx_http_request_t *r)
 {
@@ -998,6 +1299,7 @@ ngx_http_dyups_show_detail(ngx_http_request_t *r)
 
     return buf;
 }
+*/
 
 
 static ngx_buf_t *
@@ -1084,7 +1386,14 @@ ngx_http_dyups_do_delete(ngx_http_request_t *r, ngx_array_t *resource)
 
     name = value[1];
 
+    ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                      "[dyups] ngx_http_dyups_do_delete ");
+
+    ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                      "[dyups] ngx_http_dyups_do_delete body ok ");
+
     status = ngx_dyups_delete_upstream(&name, &rv);
+    //status = ngx_dyups_delete_upstream_batch(r, body, &rv);
 
 finish:
 
@@ -1129,7 +1438,6 @@ ngx_http_dyups_interface_read_body(ngx_http_request_t *r)
 
     return NGX_DONE;
 }
-
 
 static void
 ngx_http_dyups_body_handler(ngx_http_request_t *r)
@@ -1201,13 +1509,200 @@ ngx_http_dyups_body_handler(ngx_http_request_t *r)
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                   "[dyups] post upstream name: %V", &name);
 
-    status = ngx_dyups_update_upstream(&name, body, &rv);
+    if(ngx_strncasecmp(name.data, (u_char *) "delete", 6) == 0) {
+        status = ngx_dyups_delete_upstream_batch(r, body, &rv);
+    } else if(ngx_strncasecmp(name.data, (u_char *) "update", 6) == 0) {
+        status = ngx_dyups_update_upstream_batch(r, &name, body, &rv);
+        //status = ngx_dyups_update_upstream(&name, body, &rv);
+    } else {
+        status = NGX_OK;
+    }
 
 finish:
 
     ngx_http_dyups_send_response(r, status, &rv);
 }
 
+typedef struct {
+    ngx_str_t *name;
+    ngx_buf_t *buf;
+    void *next;
+} ngx_upstream_t;
+
+ngx_upstream_t * 
+ngx_http_dyups_update_json_process(ngx_http_request_t *r, ngx_buf_t *buf, ngx_str_t *rv){
+    // get data
+    ngx_upstream_t *head = NULL, *tail = NULL;
+    ngx_slab_pool_t    *shpool;
+    u_char *json_buf = NULL;
+
+    long len = buf->last - buf->pos;
+    if (len <= 0) {
+        ngx_str_set(rv, "body is null\n");
+        return NULL;
+    }
+
+    shpool = ngx_dyups_global_ctx.shpool;
+
+    // if(ngx_buf_in_memory_only(buf)) {
+    //     ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+    //                   "[dyups] too large body, len %d", len);
+    //     ngx_str_set(rv, "too large body\n");
+    //     return NULL;
+    // }
+
+    json_buf = (u_char *)malloc((len + 1)*sizeof(u_char));
+    memcpy(json_buf, buf->pos, buf->last - buf->pos);
+    json_buf[buf->last - buf->pos] = 0;
+
+    ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                      "[dyups] buf len %d, body content %s", len, json_buf);
+
+    // parse upstreams from the server list
+    cJSON *upsJson = cJSON_Parse((char *)(json_buf));
+    if (!upsJson) {
+       ngx_str_set(rv, "json parse error");
+       return NULL;
+    }
+
+    int i;
+    for (i = 0; i < cJSON_GetArraySize(upsJson); i ++) {
+        if(tail == NULL) {
+            head = (ngx_upstream_t *) malloc(sizeof(ngx_upstream_t));
+            head->next = NULL;
+            tail = head;
+        } else {
+            ngx_upstream_t *tmp = (ngx_upstream_t *) malloc(sizeof(ngx_upstream_t));
+            tmp->next = NULL;
+            tail->next = (void *) tmp;
+            tail = tmp;    
+        }        
+
+        cJSON * subitem = cJSON_GetArrayItem(upsJson, i);
+
+        cJSON *cjson_name = cJSON_GetObjectItem(subitem, "name");
+        if(cjson_name == NULL) {
+            ngx_str_set(rv, "json parse error\n");
+            return NULL;
+        }
+
+        char *nameStr = cJSON_Print(cjson_name);
+    
+        u_char *name = (u_char *)malloc(strlen(nameStr)*sizeof(u_char));
+        int name_len = ngx_sprintf(name, "%s", nameStr) - name;
+        tail->name = (ngx_str_t*)malloc(sizeof(ngx_str_t));        
+        tail->name->data  = ngx_slab_alloc_locked(shpool, 30);
+
+        memcpy(tail->name->data, name + 1, name_len-2);
+        tail->name->len = name_len - 2;
+        free(name);
+
+        cJSON *cjson_servers = cJSON_GetObjectItem(subitem, "servers");
+        if(cjson_servers == NULL) {
+            ngx_str_set(rv, "json parse error\n");
+            return NULL;
+        }
+
+        cJSON *server =  cjson_servers->child;
+        u_char *server_buf = (u_char *)malloc(sizeof(u_char)*strlen(cJSON_PrintUnformatted(cjson_servers)));
+        server_buf[0] = 0;
+        int cnt = 0;
+
+        while(server) {
+            cJSON *jserver = cJSON_GetObjectItem(server, "server");
+            if(!jserver) {ngx_str_set(rv, "json parse error\n"); return NULL;}
+            char *serverStr = cJSON_PrintUnformatted(jserver);
+            serverStr[0] = 32;
+            serverStr[strlen(serverStr)-1] = 0;
+
+            // cJSON *port = cJSON_GetObjectItem(server, "port");
+            // if(!port) {ngx_str_set(rv, "json parse error\n"); return NULL;}
+            // char *portStr = cJSON_PrintUnformatted(port);
+
+            cnt = ngx_sprintf(&server_buf[cnt], "server %s;", &serverStr[1]) - server_buf;  
+            ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                         "[dyups] upstream name 3 cnt %d, buf %s", cnt, server_buf);
+
+            server = server->next;
+        }
+
+        tail->buf = ngx_create_temp_buf(r->pool, cnt);
+        tail->buf->last = ngx_cpymem(tail->buf->pos, server_buf, cnt);
+
+        ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                         "[dyups] upstream name %V, servers %s, cnt %d", tail->name, server_buf, cnt); 
+        free(server_buf);      
+    }
+
+    free(json_buf);
+
+    return head;
+}
+
+ngx_int_t
+ngx_dyups_update_upstream_batch(ngx_http_request_t *r, ngx_str_t *name, ngx_buf_t *buf, ngx_str_t *rv)
+{
+    ngx_int_t                    status;
+    ngx_event_t                 *timer;
+    ngx_slab_pool_t             *shpool;
+    ngx_http_dyups_main_conf_t  *dmcf;
+    
+    ngx_upstream_t *upstream = ngx_http_dyups_update_json_process(r, buf, rv);
+    ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                      "[dyups] ngx_dyups_update_upstream_batch %d", upstream);
+
+    dmcf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
+                                               ngx_http_dyups_module);
+    timer = &ngx_dyups_global_ctx.msg_timer;
+    shpool = ngx_dyups_global_ctx.shpool;
+
+    if (!ngx_http_dyups_api_enable) {
+        ngx_str_set(rv, "API disabled\n");
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    if (!dmcf->trylock) {
+
+        ngx_shmtx_lock(&shpool->mutex);
+
+    } else {
+
+        if (!ngx_shmtx_trylock(&shpool->mutex)) {
+            status = NGX_HTTP_CONFLICT;
+            ngx_str_set(rv, "wait and try again\n");
+            goto finish;
+        }
+    }
+
+    ngx_http_dyups_read_msg_locked(timer);
+
+
+    while(upstream) {
+
+        status = ngx_dyups_sandbox_update(upstream->buf, rv);
+        if (status != NGX_HTTP_OK) {
+            goto finish;
+        }
+
+        status = ngx_dyups_do_update(upstream->name, upstream->buf, rv);
+        if (status == NGX_HTTP_OK) {
+            if (ngx_http_dyups_send_msg(upstream->name, upstream->buf, NGX_DYUPS_ADD)) {
+                 ngx_str_set(rv, "alert: update success "
+                         "but not sync to other process");
+                status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+               goto finish;
+            }
+        }
+
+        upstream = (ngx_upstream_t *)upstream->next;
+    }
+
+ finish:
+
+    ngx_shmtx_unlock(&shpool->mutex);
+
+    return status;
+}
 
 ngx_int_t
 ngx_dyups_update_upstream(ngx_str_t *name, ngx_buf_t *buf, ngx_str_t *rv)
